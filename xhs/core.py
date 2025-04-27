@@ -5,11 +5,12 @@ import time
 from datetime import datetime
 from enum import Enum
 from typing import NamedTuple
+import traceback
 
 import requests
 from lxml import etree
 
-from xhs.exception import (DataFetchError, ErrorEnum, IPBlockError,
+from crawler.xhs.xhs.exception import (DataFetchError, ErrorEnum, IPBlockError,
                            NeedVerifyError, SignError)
 
 from .help import (cookie_jar_to_cookie_str, download_file,
@@ -148,31 +149,45 @@ class XhsClient:
                 )
             )
 
-    def request(self, method, url, **kwargs):
-        response = self.__session.request(
-            method, url, timeout=self.timeout, proxies=self.proxies, **kwargs
-        )
-        if not len(response.text):
-            return response
-        try:
-            data = response.json()
-        except json.decoder.JSONDecodeError:
-            return response
-        if response.status_code == 471 or response.status_code == 461:
-            # someday someone maybe will bypass captcha
-            verify_type = response.headers['Verifytype']
-            verify_uuid = response.headers['Verifyuuid']
-            raise NeedVerifyError(
-                f"出现验证码，请求失败，Verifytype: {verify_type}，Verifyuuid: {verify_uuid}",
-                response=response, verify_type=verify_type, verify_uuid=verify_uuid)
-        elif data.get("success"):
-            return data.get("data", data.get("success"))
-        elif data.get("code") == ErrorEnum.IP_BLOCK.value.code:
-            raise IPBlockError(ErrorEnum.IP_BLOCK.value.msg, response=response)
-        elif data.get("code") == ErrorEnum.SIGN_FAULT.value.code:
-            raise SignError(ErrorEnum.SIGN_FAULT.value.msg, response=response)
-        else:
-            raise DataFetchError(data, response=response)
+    def request(self, method, url, max_retries=5, retry_delay=2, **kwargs):
+        retries = 0
+
+        while retries < max_retries:
+            try:
+                response = self.__session.request(
+                    method, url, timeout=self.timeout, proxies=self.proxies, **kwargs
+                )
+                if not len(response.text):
+                    return response
+
+                try:
+                    data = response.json()
+                except json.decoder.JSONDecodeError:
+                    return response
+
+                if response.status_code == 471 or response.status_code == 461:
+                    verify_type = response.headers.get('Verifytype', 'Unknown')
+                    verify_uuid = response.headers.get('Verifyuuid', 'Unknown')
+                    raise NeedVerifyError(
+                        f"出现验证码，请求失败，Verifytype: {verify_type}，Verifyuuid: {verify_uuid}",
+                        response=response, verify_type=verify_type, verify_uuid=verify_uuid
+                    )
+                elif data.get("success"):
+                    return data.get("data", data.get("success"))
+                elif data.get("code") == ErrorEnum.IP_BLOCK.value.code:
+                    raise IPBlockError(ErrorEnum.IP_BLOCK.value.msg, response=response)
+                elif data.get("code") == ErrorEnum.SIGN_FAULT.value.code:
+                    raise SignError(ErrorEnum.SIGN_FAULT.value.msg, response=response)
+                else:
+                    raise DataFetchError(data, response=response)
+
+            except Exception as e:
+                retries += 1
+                print(f"请求失败，正在重试...（{retries}/{max_retries}），错误：{e}")
+                time.sleep(retry_delay)
+
+        # 如果达到最大重试次数仍失败，抛出最后一个错误
+        raise Exception(f"请求失败，已达到最大重试次数 {max_retries} 次。")
 
     def get(self, uri: str, params=None, is_creator: bool = False, is_customer: bool = False, **kwargs):
         final_uri = uri
@@ -439,7 +454,7 @@ class XhsClient:
         }
         return self.post(uri, data)
 
-    def get_user_notes(self, user_id: str, cursor: str = ""):
+    def get_user_notes(self, user_id: str, xsec_token: str, cursor: str = ""):
         """get user notes just have simple info
 
         :param user_id: user_id you want to fetch
@@ -450,7 +465,7 @@ class XhsClient:
         :rtype: dict
         """
         uri = "/api/sns/web/v1/user_posted"
-        params = {"num": 30, "cursor": cursor, "user_id": user_id, "image_scenes": "FD_WM_WEBP"}
+        params = {"num": 30, "cursor": cursor, "user_id": user_id, "image_formats": "jpg,webp,avif", "xsec_token": xsec_token, "xsec_source": "pc_feed"}
         return self.get(uri, params)
 
     def get_user_all_notes(self, user_id: str, crawl_interval: int = 1):
@@ -501,7 +516,7 @@ class XhsClient:
                 time.sleep(crawl_interval)
         return result
 
-    def get_note_comments(self, note_id: str, cursor: str = ""):
+    def get_note_comments(self, note_id: str, xsec_token: str, cursor: str = ""):
         """get note comments
 
         :param note_id: note id you want to fetch
@@ -511,11 +526,11 @@ class XhsClient:
         :rtype: dict
         """
         uri = "/api/sns/web/v2/comment/page"
-        params = {"note_id": note_id, "cursor": cursor, "image_formats": "jpg,webp,avif"}
+        params = {"note_id": note_id, "cursor": cursor, "image_formats": "jpg,webp,avif", "xsec_token": xsec_token}
         return self.get(uri, params)
 
     def get_note_sub_comments(
-            self, note_id: str, root_comment_id: str, num: int = 30, cursor: str = ""
+            self, note_id: str, root_comment_id: str, xsec_token: str, num: int = 30, cursor: str = ""
     ):
         """get note sub comments
 
@@ -535,10 +550,11 @@ class XhsClient:
             "root_comment_id": root_comment_id,
             "num": num,
             "cursor": cursor,
+            "xsec_token": xsec_token
         }
         return self.get(uri, params)
 
-    def get_note_all_comments(self, note_id: str, crawl_interval: int = 1):
+    def get_note_all_comments(self, note_id: str, xsec_token: str, crawl_interval: int = 1):
         """get note all comments include sub comments
 
         :param crawl_interval: crawl interval for fetch
@@ -549,30 +565,39 @@ class XhsClient:
         comments_has_more = True
         comments_cursor = ""
         while comments_has_more:
-            comments_res = self.get_note_comments(note_id, comments_cursor)
-            comments_has_more = comments_res.get("has_more", False)
-            comments_cursor = comments_res.get("cursor", "")
-            comments = comments_res["comments"]
-            for comment in comments:
-                result.append(comment)
-                cur_sub_comment_count = int(comment["sub_comment_count"])
-                cur_sub_comments = comment["sub_comments"]
-                result.extend(cur_sub_comments)
-                sub_comments_has_more = comment["sub_comment_has_more"] and len(
-                    cur_sub_comments) < cur_sub_comment_count
-                sub_comment_cursor = comment["sub_comment_cursor"]
-                while sub_comments_has_more:
-                    page_num = 30
-                    sub_comments_res = self.get_note_sub_comments(
-                        note_id, comment["id"], num=page_num, cursor=sub_comment_cursor
-                    )
-                    sub_comments = sub_comments_res["comments"]
-                    sub_comments_has_more = sub_comments_res["has_more"] and len(sub_comments) == page_num
-                    sub_comment_cursor = sub_comments_res["cursor"]
-                    result.extend(sub_comments)
-                    time.sleep(crawl_interval)
+            try:
+                comments_res = self.get_note_comments(note_id, xsec_token, comments_cursor)
+                comments_has_more = comments_res.get("has_more", False)
+                comments_cursor = comments_res.get("cursor", "")
+                comments = comments_res["comments"]
+                for comment in comments:
+                    cur_sub_comment_count = int(comment["sub_comment_count"])
+                    cur_sub_comments = comment["sub_comments"]
+                    sub_comments_has_more = comment["sub_comment_has_more"] and len(cur_sub_comments) < cur_sub_comment_count
+                    sub_comment_cursor = comment["sub_comment_cursor"]
+                    
+                    # Fetch all sub-comments for the current comment
+                    while sub_comments_has_more:
+                        page_num = 10
+                        sub_comments_res = self.get_note_sub_comments(
+                            note_id, comment["id"], xsec_token=xsec_token, num=page_num, cursor=sub_comment_cursor
+                        )
+                        sub_comments = sub_comments_res["comments"]
+                        sub_comments_has_more = sub_comments_res["has_more"] and len(sub_comments) == page_num
+                        sub_comment_cursor = sub_comments_res["cursor"]
+                        cur_sub_comments.extend(sub_comments)
+                        time.sleep(crawl_interval)
+                    
+                    # Add the sub-comments to the main comment
+                    comment["sub_comments"] = cur_sub_comments
+                    result.append(comment)
+            except Exception:
+                print(traceback.format_exc())
+                return result
+            
             time.sleep(crawl_interval)
         return result
+
 
     def comment_note(self, note_id: str, content: str):
         """comment a note
