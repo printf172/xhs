@@ -20,7 +20,7 @@ def get_context_page(instance, stealth_js_path):
     return context, page
 
 
-stealth_js_path = "stealth.min.js"
+stealth_js_path = "crawler/MediaCrawler/libs/stealth.min.js"
 print("正在启动 playwright")
 playwright = sync_playwright().start()
 browser_context, context_page = get_context_page(playwright, stealth_js_path)
