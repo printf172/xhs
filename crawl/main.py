@@ -2,6 +2,7 @@ import os
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../'))
 import pandas as pd
+import numpy as np
 import requests
 from crawler.xhs.xhs import XhsClient
 from common.utils import tools
@@ -16,16 +17,66 @@ from tencentcloud.iai.v20200303 import iai_client, models
 import cv2
 import easyocr
 from common.logs import set_logger
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor
 
+# 设置日志
 log_path = str(os.path.dirname(os.path.abspath(__file__)))
 logger = set_logger(log_path, "startCrawl")
 
+# 配置文件
+COOKIE_FILE = "crawler/xhs/crawl/cookie.txt"
+RESULT_DIR = "crawler/xhs/crawl/results"
+MAX_THREADS = 1  # 最大线程数
+
+# 确保结果目录存在
+if not os.path.exists(RESULT_DIR):
+    os.makedirs(RESULT_DIR)
+
+# 线程安全的Cookie管理
+cookie_lock = threading.Lock()
+cookie_queue = queue.Queue()
+
+def load_cookie():
+    """从文件加载cookie，并在读取后删除文件内容"""
+    with cookie_lock:
+        if not os.path.exists(COOKIE_FILE):
+            logger.error(f"Cookie文件不存在: {COOKIE_FILE}")
+            return None
+        
+        try:
+            with open(COOKIE_FILE, 'r') as file:
+                cookie = file.read().strip()
+            
+            # 读取后清空文件
+            if cookie:
+                with open(COOKIE_FILE, 'w') as file:
+                    file.write("")
+                logger.info("Cookie已加载并从文件中删除")
+                return cookie
+            else:
+                logger.error("Cookie文件为空")
+                return None
+        except Exception as e:
+            logger.error(f"读取Cookie文件出错: {e}")
+            return None
+
+def wait_for_cookie():
+    """等待新的cookie"""
+    logger.info("等待新的Cookie... (请将Cookie放入cookie.txt文件)")
+    while True:
+        cookie = load_cookie()
+        if cookie:
+            logger.info("已获取新Cookie，继续执行")
+            return cookie
+        time.sleep(10)  # 每10秒检查一次
+
+# 保留原有功能函数
 def detect_face(url):
     try:
         logger.info(f"开始进行人脸识别:{url}")
         # 实例化一个认证对象，入参需要传入腾讯云账户 SecretId 和 SecretKey，此处还需注意密钥对的保密
-        # 代码泄露可能会导致 SecretId 和 SecretKey 泄露，并威胁账号下所有资源的安全性。以下代码示例仅供参考，建议采用更安全的方式来使用密钥，请参见：https://cloud.tencent.com/document/product/1278/85305
-        # 密钥可前往官网控制台 https://console.cloud.tencent.com/cam/capi 进行获取
         cred = credential.Credential("", "")
         # 实例化一个http选项，可选的，没有特殊需求可以跳过
         httpProfile = HttpProfile()
@@ -43,10 +94,8 @@ def detect_face(url):
             "Image": "",
             "Url": url,
             "MaxFaceNum": 5,
-            # "MinFaceSize": 34,
             "NeedFaceAttributes": 1,
             "NeedQualityDetection": 1,
-            # "NeedRotateDetection": 1
         }
         req.from_json_string(json.dumps(params))
 
@@ -58,7 +107,24 @@ def detect_face(url):
     except TencentCloudSDKException as err:
         logger.info(err)
         return ''
-    
+
+
+def convert_numpy_types(obj):
+    """递归转换NumPy数据类型为Python原生类型"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy_types(item) for item in obj)
+    else:
+        return obj
 
 def read_text(img_path, compress_factor: int = 1, lang_list=None):
     if lang_list is None:
@@ -72,7 +138,10 @@ def read_text(img_path, compress_factor: int = 1, lang_list=None):
         img = cv2.resize(img, (int(img.shape[1] / compress_factor), int(img.shape[0] / compress_factor)))
 
     reader = easyocr.Reader(lang_list)
-    return reader.readtext(img)
+    ocr_results = reader.readtext(img)
+    converted_results = convert_numpy_types(ocr_results)
+    return converted_results
+
 
 def download_image(url, save_path):
     try:
@@ -93,28 +162,28 @@ def download_image(url, save_path):
     except Exception:
         logger.error(f'download_image出现异常: {traceback.format_exc()}')
         return False
-    
 
 def sign(uri, data=None, a1="", web_session=""):
     # 填写自己的 flask 签名服务端口地址
-    res = requests.post("http://localhost:5005/sign",
-                        json={"uri": uri, "data": data, "a1": a1, "web_session": web_session})
-    signs = res.json()
-    return {
-        "x-s": signs["x-s"],
-        "x-t": signs["x-t"]
-    }
+    for i in range(20):
+        try:
+            res = requests.post("http://localhost:5005/sign",
+                                json={"uri": uri, "data": data, "a1": a1, "web_session": web_session})
+            signs = res.json()
+            return {
+                "x-s": signs["x-s"],
+                "x-t": signs["x-t"]
+            }
+        except Exception:
+            pass
 
-
-cookie = "abRequestId=122db771-4363-5033-8560-5e4c927b1725; a1=190a55c8149bjjte6pipi627kkp29c9vxdmyavr6v30000247366; webId=ca267d989dae0a7532ed28fc3e8bed1b; gid=yj8022SY2dCiyj8022SYyfhF4jDVV9dKU3U36KhKJWTTUvq8JjSjh0888J4WqKK8JJJdYKdj; ads-portal_worker_plugin_uuid=1c7d604b00a14acba62501f557c5fa60; x-user-id-ruzhu.xiaohongshu.com=5ba367b89f64dc0001e1cf9e; customerClientId=070900957451639; x-user-id-creator.xiaohongshu.com=5ba367b89f64dc0001e1cf9e; webBuild=4.62.3; _did=169AC6EF; unread={%22ub%22:%2267da2e220000000009015f69%22%2C%22ue%22:%2267ca6b900000000028035023%22%2C%22uc%22:20}; web_session=040069b6fe74d368b05adc52ca354b75573956; xsecappid=xhs-pc-web; acw_tc=0a00dcc017457359812634157ef46e1eb9a6e2087f81bcd19f924498492883; loadts=1745735981623; acw_tc=0a0b147c17457359821348060e7a417399ae178f645a4ee5e622c1cf6ae592; websectiga=f47eda31ec99545da40c2f731f0630efd2b0959e1dd10d5fedac3dce0bd1e04d; sec_poison_id=5b3e24f9-034a-4ade-8a4e-ca276ebf85b6"
-xhs_client = XhsClient(cookie, sign=sign)
 headers = {
     'Authorization': 'test'
 }
 
-def summarize_with_ernie(content, max_retries=3, backoff_factor=2):
-    API_KEY = "nzmhDqH4wycCGUeQBqpHoBBZ"
-    SECRET_KEY = "vRj0EyyzlfPjxDrbTiwM8lCgCKJGsXI5"
+def summarize_with_ernie(content, max_retries=2000, backoff_factor=2):
+    API_KEY = ""
+    SECRET_KEY = ""
     def get_access_token():
         """
         使用 AK，SK 生成鉴权签名（Access Token）
@@ -124,9 +193,7 @@ def summarize_with_ernie(content, max_retries=3, backoff_factor=2):
         params = {"grant_type": "client_credentials", "client_id": API_KEY, "client_secret": SECRET_KEY}
         return str(requests.post(url, params=params).json().get("access_token"))
 
-    
     url = "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions?access_token=" + get_access_token()
-    
     
     payload = json.dumps({
         "messages": [
@@ -158,7 +225,8 @@ def summarize_with_ernie(content, max_retries=3, backoff_factor=2):
                 result = response.json().get('result')
                 logger.info(f"Request successful. Elapsed time: {elapsed_time:.2f} seconds")
                 logger.info(f"Result: {result}")
-                return result
+                if result:
+                    return result
             else:
                 logger.error(f"Error: {response.status_code} - {response.text}")
                 retries += 1
@@ -171,94 +239,392 @@ def summarize_with_ernie(content, max_retries=3, backoff_factor=2):
     logger.error("Max retries reached. Failed to get summary from ERNIE.")
     return None
 
-def get_user_notes(data):
+def get_user_notes(data, cookie):
     user_works = []
     user_id = data['user_id']
     xsec_token = data['xsec_token']
     logger.info(f'开始获取用户作品：{user_id}')
-    res = xhs_client.get_user_notes(user_id, xsec_token)
-    notes = tools.safe_get(res, ['notes'])
-    if not notes:
-        logger.error(f'获取用户作品异常:{user_id}')
-        return ''
     
-    logger.info(f"共找到{len(notes)}篇笔记")
-    cursor = tools.safe_get(res, ['cursor'])
-    for note in notes:
-        try:
-            note_id = tools.safe_get(note, ['note_id'])
-            xsec_token = tools.safe_get(note, ['xsec_token'])
-            note_detail = xhs_client.get_note_by_id(note_id, xsec_token)
-            type = tools.safe_get(note_detail, 'type')
-            note_desc = tools.safe_get(note_detail, 'desc')
-            if type == 'video':
-                logger.info(f'当前笔记是视频:{type}')
-                continue
-            image_list = tools.safe_get(note_detail, 'image_list')
-            logger.info(f"共找到{len(image_list)}张图片")
-            for i, img in enumerate(image_list):
-                live_photo = tools.safe_get(img, 'live_photo')
-                if live_photo:
-                    logger.info(f'当前图片是动图：{live_photo}')
+    # 使用传入的cookie创建XhsClient实例
+    xhs_client = XhsClient(cookie, sign=sign)
+    
+    try:
+        res = xhs_client.get_user_notes(user_id, xsec_token)
+        notes = tools.safe_get(res, ['notes'])
+        if not notes:
+            logger.error(f'获取用户作品异常:{user_id}')
+            return ''
+        
+        logger.info(f"共找到{len(notes)}篇笔记")
+        cursor = tools.safe_get(res, ['cursor'])
+        for note in notes:
+            try:
+                note_id = tools.safe_get(note, ['note_id'])
+                xsec_token = tools.safe_get(note, ['xsec_token'])
+                note_detail = xhs_client.get_note_by_id(note_id, xsec_token)
+                type = tools.safe_get(note_detail, 'type')
+                note_desc = tools.safe_get(note_detail, 'desc')
+                if type == 'video':
+                    logger.info(f'当前笔记是视频:{type}')
                     continue
-                img_url = tools.safe_get(img, 'url_default')
-                img_path = f'crawler/xhs/crawl/img/{tools.get_current_timestamp()}.png'
-                download_image(img_url, img_path)
-                res = read_text(img_path)
-                if res:
-                    img['text'] = 1
-                else:
-                    img['text'] = 0
-                
-                url = 'http://116.62.236.232/ai-huanzhuang-sys/file/uploadFile'
-                files = {'file': open(img_path, 'rb')}
-                response = tools.get_html(url, files=files, headers=headers)
-                if response['code'] == 0:
-                    oss_path = response['data']
-                    img['oss_path'] = oss_path
-                else:
-                    raise "阿里云上传图片异常"
-                
-                face_info = detect_face(img_url)
-                face_info = tools.get_json(face_info)
-                if face_info:
-                    face_infos = tools.safe_get(face_info, ['FaceInfos'])
-                    img['face_count'] = len(face_infos)
+                image_list = tools.safe_get(note_detail, 'image_list')
+                logger.info(f"共找到{len(image_list)}张图片")
+                for i, img in enumerate(image_list):
+                    live_photo = tools.safe_get(img, 'live_photo')
+                    if live_photo:
+                        logger.info(f'当前图片是动图：{live_photo}')
+                        continue
+                    img_url = tools.safe_get(img, 'url_default')
+                    img_path = f'crawler/xhs/crawl/img/{note_id}/{tools.get_current_timestamp()}.png'
+                    download_image(img_url, img_path)
+                    img['text'] = read_text(img_path)
                     
-                    img['face_info'] = face_info
-                    image_list[i] = img
+                    url = 'http://116.62.236.232/ai-huanzhuang-sys/file/uploadFile'
+                    files = {'file': open(img_path, 'rb')}
+                    response = tools.get_html(url, files=files, headers=headers)
+                    if response['code'] == 0:
+                        oss_path = response['data']
+                        img['oss_path'] = oss_path
+                    else:
+                        raise Exception("阿里云上传图片异常")
+                    
+                    face_info = detect_face(img_url)
+                    face_info = tools.get_json(face_info)
+                    if face_info:
+                        face_infos = tools.safe_get(face_info, ['FaceInfos'])
+                        img['face_count'] = len(face_infos)
+                        
+                        img['face_info'] = face_info
+                        image_list[i] = img
+
+                note_detail['image_list'] = image_list
+                note['note_detail'] = note_detail
+                user_works.append(note)
+                logger.info(f'***************完成笔记{note_id}的采集***************')
+            except Exception:
+                logger.error(traceback.format_exc())
+                time.sleep(2)
+        
+        # 请求成功，将cookie放回队列
+        cookie_queue.put(cookie)
+        return user_works
+    except Exception as e:
+        logger.error(f"获取用户笔记出错: {e}")
+        # 请求失败，可能是cookie问题，不返回cookie到队列
+        return ''
+import time
+import traceback
+from queue import Queue
+
+def search(user_id, max_retries=20, retry_delay=1):
+    """
+    搜索用户，支持重试机制
+    
+    参数:
+        user_id: 用户ID
+        max_retries: 最大重试次数，默认20次
+        retry_delay: 初始重试延迟(秒)，默认1秒
+    
+    返回:
+        (id, xsec_token) 元组，如果搜索失败则返回 ('', '')
+    """
+    retry_count = 0
+    
+    while retry_count <= max_retries:  # 使用 <= 确保总共尝试 max_retries + 1 次
+        if retry_count > 0:
+            logger.info(f'搜索用户 {user_id} 第 {retry_count} 次重试')
+            # 指数退避策略，每次重试延迟增加
+            sleep_time = min(retry_delay * (2 ** (retry_count - 1)), 30)  # 最大延迟30秒
+            time.sleep(sleep_time)
+        
+        logger.info(f'开始搜索：{user_id}')
+        
+        cookie = None
+        try:
+            # 获取可用的cookie
+            if cookie_queue.empty():
+                logger.warning(f"Cookie队列为空，等待新cookie...")
+                cookie = wait_for_cookie()
+            else:
+                cookie = cookie_queue.get()
+                
+            # 使用传入的cookie创建XhsClient实例
+            xhs_client = XhsClient(cookie, sign=sign)
+            
+            res = xhs_client.get_user_by_keyword(user_id)
+            if not res:
+                logger.error(f'搜索异常:{user_id}')
+                if cookie:
+                    cookie_queue.put(cookie)
+                    cookie = None
+                
+                retry_count += 1
+                continue  # 重试
+                
+            users = tools.safe_get(res, ['users'])
+            find = False
+            for user in users:
+                red_id = tools.safe_get(user, ['red_id'])
+                if user_id == red_id:
+                    id = tools.safe_get(user, ['id'])  # 注意：这里从当前user获取，而不是固定用index 0
+                    xsec_token = tools.safe_get(user, ['xsec_token'])
+                    find = True
+                    
+                    # 请求成功，将cookie放回队列
+                    if cookie:
+                        cookie_queue.put(cookie)
+                        cookie = None
+                    
+                    logger.info(f'成功找到用户 {user_id}')
+                    return id, xsec_token
+                    
+            if not find:    
+                logger.error(f'未搜索到相关用户 {user_id}')
+                
+                # 请求成功但未找到用户，将cookie放回队列
+                if cookie:
+                    cookie_queue.put(cookie)
+                    cookie = None
+                
+                # 这种情况不需要重试，直接返回空结果
+                return '', ''
+                
+        except Exception as e:
+            error_msg = traceback.format_exc()
+            logger.error(f"搜索用户出错: {error_msg}")
+            
+            # 无论出错原因，都将cookie放回队列
+            if cookie:
+                cookie_queue.put(cookie)
+                cookie = None
+            
+            retry_count += 1
+            # 如果已经达到最大重试次数，则退出循环
+            if retry_count > max_retries:
+                logger.error(f"搜索用户 {user_id} 失败，已达到最大重试次数 {max_retries}")
+                break
+        finally:
+            # 确保在任何情况下都归还cookie
+            if cookie:
+                cookie_queue.put(cookie)
+    
+    # 所有重试都失败了
+    return '', ''
+
+
+def get_comments(data, user_work, cookie):
+    user_id = data['user_id']
+    xsec_token = tools.safe_get(user_work, ['xsec_token'])
+    note_id = tools.safe_get(user_work, ['note_id'])
+    
+    # 使用传入的cookie创建XhsClient实例
+    xhs_client = XhsClient(cookie, sign=sign)
+    
+    try:
+        comments = xhs_client.get_note_all_comments(note_id, xsec_token)
+        # 只保留作者或者包含作者参与的评论
+        # This is a summary of the chat history as a recap: 的评论
+        filtered_comments = []
+
+        for comment in comments:
+            comment_user_id = tools.safe_get(comment, ['user_info', 'user_id'])
+            sub_comments = tools.safe_get(comment, ['sub_comments'], [])
+
+            # 检查主评论是否由作者参与
+            if comment_user_id == user_id:
+                filtered_comments.append(comment)
+                continue
+
+            # 检查子评论是否由作者参与
+            author_in_sub_comments = False
+            for sub_comment in sub_comments:
+                sub_comment_user_id = tools.safe_get(sub_comment, ['user_info', 'user_id'])
+                if sub_comment_user_id == user_id:
+                    author_in_sub_comments = True
                     break
 
-            note_detail['image_list'] = image_list
-            note['note_detail'] = note_detail
-            user_works.append(note)
-            logger.info(f'***************完成笔记{note_id}的采集***************')
-            break
-        except Exception:
-            logger.error(traceback.format_exc())
-            time.sleep(2)
-            
-    return user_works
-    
+            # 如果主评论或子评论中包含作者的评论，将整个主评论和所有子评论保留
+            if author_in_sub_comments:
+                filtered_comments.append(comment)
 
-def search(user_id):    
-    logger.info(f'开始搜索：{user_id}')
-    res = xhs_client.get_user_by_keyword(user_id)
-    if not res:
-        logger.error(f'搜索异常:{user_id}')
-        return '', ''
-    users = tools.safe_get(res, ['users'])
-    find = False
-    for user in users:
-        red_id = tools.safe_get(user, ['red_id'])
-        if user_id == red_id:
-            id = tools.safe_get(res, ['users', 0, 'id'])
-            xsec_token = tools.safe_get(res, ['users', 0, 'xsec_token'])
-            find = True
-            return id, xsec_token
-    if not find:    
-        logger.error(f'未搜索到相关用户')
-        return '', ''
+        user_work['note_detail']['comments'] = filtered_comments
+        
+        if filtered_comments:
+            # 拼接评论内容
+            comments_content = '\n'.join([tools.safe_get(comment, 'content', '') for comment in filtered_comments])
+            note_desc = tools.safe_get(user_work, ['note_detail', 'desc'])
+            prompt = f"""
+                以下是小红书的一篇笔记内容和评论，请根据这些内容生成一个总结，介绍这篇笔记的主要内容、地理位置（如果有提到）、以及其他重要信息：
+
+                笔记内容:
+                {note_desc}
+
+                评论内容:
+                {comments_content}
+                """
+            logger.info(prompt)
+            user_work['note_detail']['summary'] = summarize_with_ernie(prompt)
+        
+        # 请求成功，将cookie放回队列
+        cookie_queue.put(cookie)
+        return user_work
+    except Exception as e:
+        logger.error(f"获取评论出错: {e}")
+        # 请求失败，可能是cookie问题，不返回cookie到队列
+        return user_work
+
+def is_save(image_list, blogger_gender=None):
+    """
+    分析图片列表，决定图片是否符合要求1或要求2
+    返回: 1 (符合要求1), 2 (符合要求2), [1, 2] (两者都符合), 或 False (都不符合)
+    """
+    if not image_list:
+        return False
+    
+    result = []
+    
+    for img in image_list:
+        face_count = tools.safe_get(img, ['face_count'], 0)
+        text = img.get('text', '')
+        
+        # 如果图片有较多文字，跳过
+        if len(text) > 3:
+            continue
+        
+        # 检查是否符合基本条件：单人脸
+        if face_count != 1:
+            continue
+        
+        # 获取人脸信息
+        face_info = tools.safe_get(img, ['face_info', 'FaceInfos', 0], {})
+        face_attributes = tools.safe_get(face_info, ['FaceAttributesInfo'], {})
+        
+        # 获取人脸角度
+        pitch = tools.safe_get(face_attributes, ['Pitch'], 0)
+        yaw = tools.safe_get(face_attributes, ['Yaw'], 0)
+        
+        # 获取年龄和性别
+        age = tools.safe_get(face_attributes, ['Age'], 25)
+        gender = tools.safe_get(face_attributes, ['Gender'], '')
+        
+        # 获取人脸在图片中的位置和大小信息
+        face_rect = tools.safe_get(face_info, ['FaceRect'], {})
+        face_width = tools.safe_get(face_rect, ['Width'], 0)
+        face_height = tools.safe_get(face_rect, ['Height'], 0)
+        face_x = tools.safe_get(face_rect, ['X'], 0)
+        face_y = tools.safe_get(face_rect, ['Y'], 0)
+        
+        # 获取图片尺寸
+        img_width = tools.safe_get(img, ['width'], 1)
+        img_height = tools.safe_get(img, ['height'], 1)
+        
+        # 计算人脸占图片的比例
+        face_area_ratio = (face_width * face_height) / (img_width * img_height)
+        
+        # 计算人脸中心点与图片中心点的距离
+        img_center_x = img_width / 2
+        img_center_y = img_height / 2
+        face_center_x = face_x + face_width / 2
+        face_center_y = face_y + face_height / 2
+        
+        # 归一化距离（相对于图片尺寸）
+        distance_from_center = (((face_center_x - img_center_x) / img_width) ** 2 + 
+                               ((face_center_y - img_center_y) / img_height) ** 2) ** 0.5
+        
+        # 检查要求1：人物大且居中
+        is_requirement1 = False
+        if face_area_ratio > 0.15 and distance_from_center < 0.15:
+            is_requirement1 = True
+            if 1 not in result:
+                result.append(1)
+        
+        # 检查要求2：脸部倾斜度低，年龄15-40岁
+        is_requirement2 = False
+        if (abs(pitch) < 25 and abs(yaw) < 25 and 
+            15 <= age <= 40 and 
+            (blogger_gender is None or gender == blogger_gender)):
+            is_requirement2 = True
+            if 2 not in result:
+                result.append(2)
+    
+    # 如果没有符合任何要求的图片，返回False
+    if not result:
+        return False
+    
+    # 如果只符合一个要求，返回该要求编号
+    if len(result) == 1:
+        return result[0]
+    
+    # 如果两个要求都符合，返回列表[1, 2]
+    return result
+
+def process_data_item(data, output_path, retry_limit=3):
+    """处理单个数据项"""
+    try:
+        retries = 0
+        while retries < retry_limit:
+            try:
+                # 获取可用的cookie
+                if cookie_queue.empty():
+                    cookie = wait_for_cookie()
+                else:
+                    cookie = cookie_queue.get()
+                
+                # 如果需要搜索用户ID
+                if data['id'] and not data.get('user_id'):
+                    id, xsec_token = search(data['id'], cookie)
+                    data["user_id"] = id
+                    data["xsec_token"] = xsec_token
+                
+                if data.get('user_id') and data.get('xsec_token'):
+                    user_works = get_user_notes(data, cookie)
+                    data["user_works"] = user_works
+                    
+                    for i, user_work in enumerate(user_works):
+                        image_list = tools.safe_get(user_work,['note_detail','image_list'])
+                        for j, image in enumerate(image_list):
+                            result = is_save([image])
+                            if result:
+                                image['dataTypeArr'] = result
+                            else:
+                                del image_list[j]
+                                
+                        if image_list:
+                            ret = get_comments(data, user_work, cookie)
+                            user_works[i] = ret
+                            
+                            data["user_works"] = user_works
+                            
+                            url = "http://116.62.236.232/ai-huanzhuang-sys/huanzhuang/reportData"
+                            response = tools.get_html(url, json_data={"jsonData": json.dumps(data)}, headers=headers)
+                            if response['code'] == 0:
+                                logger.info('数据录入成功')
+                            else:
+                                raise Exception("数据录入异常")
+                    
+                    # 将处理后的数据写入输出文件
+                    with open(output_path, 'a', encoding='utf-8') as outfile:
+                        outfile.write(json.dumps(data, ensure_ascii=False) + '\n')
+
+                    logger.info(f'数据已写入 {output_path}')
+                    with open("crawler/xhs/crawl/id.txt", 'w', encoding='utf-8') as last_id_file:
+                        last_id_file.write(data['id'])
+                
+                # 处理成功，跳出重试循环
+                break
+                
+            except Exception as e:
+                retries += 1
+                logger.error(f"处理数据项出错: {e}")
+                logger.error(traceback.format_exc())
+                if retries < retry_limit:
+                    logger.error(f"重试 ({retries}/{retry_limit})...")
+                    time.sleep(2)  # 等待2秒后重试
+                else:
+                    logger.error(f"重试{retry_limit}次后失败，跳过ID {data['id']}。")
+    except Exception as e:
+        logger.error(f"处理数据项时发生未处理的异常: {e}")
+        logger.error(traceback.format_exc())
 
 
 def process_excel(file_path, output_path):
@@ -296,149 +662,8 @@ def process_excel(file_path, output_path):
             file.write(json.dumps(json_object, ensure_ascii=False) + '\n')
 
 
-def do_huanzhuang(data, img):
-    city = data['city']
-    gender = data['gender']
-    url = 'http://116.62.236.232/ai-huanzhuang-sys/huanzhuang/doHuanzhuan'
-    json_data = {
-        "personImageUrl": img['oss_path'],
-        "personGender": 1 if gender == "男" else 0,
-        "city": city,
-        "day": "2024-11-11",
-    }
-    response = tools.get_html(url, json_data=json_data, headers=headers, timeout=50)
-    if response['code'] == 0:
-        huanzhuang_url = response['data']['url']
-        img['huanzhuang_url'] = huanzhuang_url
-    else:
-        raise "换装异常"
-    return img
-
-def get_comments(data, user_work):
-    user_id = data['user_id']
-    xsec_token = data['xsec_token']
-    note_id = tools.safe_get(user_work, ['note_id'])
-    comments = xhs_client.get_note_all_comments(note_id, xsec_token)
-    # 只保留作者或者包含作者参与的评论
-    filtered_comments = []
-
-    for comment in comments:
-        comment_user_id = tools.safe_get(comment, ['user_info', 'user_id'])
-        sub_comments = tools.safe_get(comment, ['sub_comments'], [])
-
-        # 检查主评论是否由作者参与
-        if comment_user_id == user_id:
-            filtered_comments.append(comment)
-            continue
-
-        # 检查子评论是否由作者参与
-        author_in_sub_comments = False
-        for sub_comment in sub_comments:
-            sub_comment_user_id = tools.safe_get(sub_comment, ['user_info', 'user_id'])
-            if sub_comment_user_id == user_id:
-                author_in_sub_comments = True
-                break
-
-        # 如果主评论或子评论中包含作者的评论，将整个主评论和所有子评论保留
-        if author_in_sub_comments:
-            filtered_comments.append(comment)
-
-    user_work['note_detail']['comments'] = filtered_comments
-    
-    # 拼接评论内容
-    comments_content = '\n'.join([tools.safe_get(comment, 'content', '') for comment in filtered_comments])
-    note_desc = tools.safe_get(user_work, ['desc','note_detail'])
-    prompt = f"""
-        以下是小红书的一篇笔记内容和评论，请根据这些内容生成一个总结，介绍这篇笔记的主要内容、地理位置（如果有提到）、以及其他重要信息：
-
-        笔记内容:
-        {note_desc}
-
-        评论内容:
-        {comments_content}
-        """
-    logger.info(prompt)
-    user_work['note_detail']['summary'] = summarize_with_ernie(prompt)
-    return user_work
-
-
-def is_save(image_list, blogger_gender=None):
-    """
-    分析图片列表，决定是否保留笔记及其中的图片
-    """
-    if not image_list:
-        return {'save_note': False, 'filtered_images': [], 'face_images': [], 'non_face_images': []}
-    
-    # 分类图片
-    face_images = []  # 带脸照片
-    multi_face_images = []  # 多人脸照片(>=2)
-    non_face_images = []  # 不带脸照片
-    problematic_face_images = []  # 有问题的人脸照片(年龄不符/性别不符/角度过大/有文字)
-    
-    # 遍历图片列表，进行分类
-    for img in image_list:
-        face_count = tools.safe_get(img, ['face_count'], 0)
-        
-        text = img['text']
-        if len(text)>3:
-            continue
-        
-        if face_count == 0:
-            # 不带脸的图片
-            non_face_images.append(img)
-            continue
-            
-        if face_count >= 2:
-            # 多人脸图片
-            multi_face_images.append(img)
-            continue
-            
-        # 单人脸图片，检查是否有问题
-        pitch = tools.safe_get(img, ['face_info', 'FaceInfos', 0, "FaceAttributesInfo", "Pitch"], 0)
-        yaw = tools.safe_get(img, ['face_info', 'FaceInfos', 0, "FaceAttributesInfo", "Yaw"], 0)
-        age = tools.safe_get(img, ['face_info', 'FaceInfos', 0, 'FaceAttributesInfo', 'Age'], 25)
-        gender = tools.safe_get(img, ['face_info', 'FaceInfos', 0, 'FaceAttributesInfo', 'Gender'], '')
-        
-        # 检查是否为问题图片
-        if (age < 15 or age > 40 or 
-            (blogger_gender and gender != blogger_gender) or 
-            abs(pitch) > 25 or abs(yaw) > 25):
-            problematic_face_images.append(img)
-        else:
-            # 合格的单人脸图片
-            face_images.append(img)
-    
-    # 规则1: 如果一篇笔记中一张带脸照片都没有，则整篇笔记不要
-    total_face_images = len(face_images) + len(multi_face_images) + len(problematic_face_images)
-    if total_face_images == 0:
-        return False
-    
-    # 规则2: 如果一篇笔记中只有一张带脸照片且这张图人脸数大于等于2，则整篇笔记不要
-    if total_face_images == 1 and len(multi_face_images) == 1:
-        return False
-    
-    # 规则3: 特殊情况判断
-    valid_face_images = face_images.copy()
-    if len(multi_face_images) > 0:
-        # 如果去除多人脸照片后，只剩一张带脸照片且有问题
-        if len(face_images) == 1 and len(problematic_face_images) > 0:
-            return False
-    
-    # 过滤后的图片列表 = 合格的单人脸图片 + 不带脸的图片
-    filtered_images = valid_face_images + non_face_images
-    
-    # 为每张图片添加标签
-    for img in valid_face_images:
-        img['is_template'] = True  # 标记为模板照片
-    
-    # 如果过滤后没有图片，则不保留笔记
-    if not filtered_images:
-        return False
-    
-    return True
-
-
-def process_json(file_path, output_path, retry_limit=3):
+def process_json(file_path, output_json_file, retry_limit=3):
+    """多线程处理JSON文件"""
     unique_ids = set()
     last_processed_id = None
     
@@ -450,7 +675,18 @@ def process_json(file_path, output_path, retry_limit=3):
         pass
 
     start_processing = False if last_processed_id else True
-        
+    
+    # 初始化线程池
+    executor = ThreadPoolExecutor(max_workers=MAX_THREADS)
+    futures = []
+    
+    # 初始化cookie队列
+    initial_cookie = load_cookie()
+    if initial_cookie:
+        cookie_queue.put(initial_cookie)
+    else:
+        logger.warning("未找到初始Cookie，将在需要时等待新Cookie")
+    
     # 读取JSON文件并处理每一行
     with open(file_path, 'r', encoding='utf-8') as file:
         for line in file:
@@ -464,66 +700,45 @@ def process_json(file_path, output_path, retry_limit=3):
                 
                 if data['id'] not in unique_ids:
                     unique_ids.add(data['id'])
-                    retries = 0
-                    while retries < retry_limit:
-                        try:
-                            # if data['id'] and not data['user_id']:
-                                # id, xsec_token = search(data['id'])
-                                # data["user_id"] = id
-                                # data["xsec_token"] = xsec_token
-                            if data['user_id'] and data['xsec_token']:
-                                user_works = get_user_notes(data)
-                                data["user_works"] = user_works
-                                # 将处理后的数据写入输出文件
-                                with open(output_path, 'a', encoding='utf-8') as outfile:
-                                    outfile.write(json.dumps(data, ensure_ascii=False) + '\n')
+                    
+                    # 采集xsec_token
+                    # if data['id']:
+                    #     id, xsec_token = search(data['id'])
+                    #     data["user_id"] = id
+                    #     data["xsec_token"] = xsec_token
+                        
+                    #     # 将处理后的数据写入输出文件
+                    #     with open(output_json_file, 'a', encoding='utf-8') as outfile:
+                    #         outfile.write(json.dumps(data, ensure_ascii=False) + '\n')
 
-                                logger.info('数据已写入', output_path)
-                                
-                                for i, user_work in enumerate(user_works):
-                                    image_list = tools.safe_get(user_work,['note_detail','image_list'])
-                                    for i, image in enumerate(image_list):
-                                        if is_save([image]):
-                                            img = do_huanzhuang(data, image)
-                                            image_list[i] = img
-                                        else:
-                                            del image_list[i]
-                                            
-                                    if image_list:
-                                        user_work = get_comments(data, user_work)
-                                        user_works[i] = user_work
-                                        
-                                        data["user_works"] = user_works
-                                        
-                                        url = "http://116.62.236.232/ai-huanzhuang-sys/huanzhuang/reportData"
-                                        response = tools.get_html(url, json_data= {"jsonData": json.dumps(data)}, headers=headers)
-                                        if response['code'] == 0:
-                                            logger.info('数据录入成功')
-                                        else:
-                                            raise "数据录入异常"
-                                with open("crawler/xhs/crawl/id.txt", 'w', encoding='utf-8') as last_id_file:
-                                    last_id_file.write(data['id'])
-                        except Exception:
-                            retries += 1
-                            logger.error(f"Error during search for id {data['id']}: {traceback.format_exc()}")
-                            if retries < retry_limit:
-                                logger.error(f"Retrying ({retries}/{retry_limit})...")
-                                time.sleep(2)  # 等待2秒后重试
-                            else:
-                                logger.error(f"Failed after {retry_limit} retries. Skipping id {data['id']}.")
-            except Exception:
+                    #     logger.info(f'数据已写入{output_json_file}')
+
+                    if data['user_id'] and data['xsec_token']:
+                        # 提交任务到线程池
+                        future = executor.submit(process_data_item, data, f'{RESULT_DIR}/data.json', retry_limit)
+                        futures.append(future)
+            except Exception as e:
+                logger.error(f"解析JSON行出错: {e}")
                 logger.error(traceback.format_exc())
     
+    # 等待所有任务完成
+    for future in futures:
+        try:
+            future.result()
+        except Exception as e:
+            logger.error(f"线程执行出错: {e}")
+            logger.error(traceback.format_exc())
+    
+    # 关闭线程池
+    executor.shutdown()
 
 if __name__ == "__main__":
     try:
-        input_file = "/Users/wangjie/Downloads/4城市.xlsx"  # 输入文件路径
+        input_file = "crawler/xhs/crawl/4城市（修改后去重）.xlsx"  # 输入文件路径
         output_file = "crawler/xhs/crawl/4城市.json"  # 输出文件路径
-        # output_json_file = "crawler/xhs/crawl/4城市2.json"  # 输出文件路径
-        output_json_file = "crawler/xhs/crawl/data.json"  # 输出文件路径
+        output_json_file = "crawler/xhs/crawl/ori_data.json"  # 输出文件路径
         
         # process_excel(input_file, output_file)
-        process_json(output_file, output_json_file)
+        process_json(output_json_file, output_json_file)
     except Exception:
         logger.error(traceback.format_exc())
-
